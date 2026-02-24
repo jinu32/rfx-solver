@@ -1,0 +1,469 @@
+{
+  "version": "1.0-test",
+  "engine": {
+    "expr": "jqx/1.0",
+    "rounding": {
+      "score_decimals": 1,
+      "money_decimals": 4
+    }
+  },
+  "paths": {
+    "rfq": "$.rfq",
+    "quotes": "$.quotes[*]"
+  },
+  "normalize": {
+    "timezone": {
+      "rfq_deadline_tz": "$.rfq.cover.quote_deadline.timezone",
+      "supplier_tz_default": "UTC"
+    },
+    "currency": {
+      "base_currency": "$.rfq.quote_header.currency",
+      "fx_source": "fx_table",
+      "rules": [
+        {
+          "id": "fx_to_base",
+          "type": "money_convert",
+          "amount_path": "$.quote.line_items[*].pricing[*].unit_price",
+          "from_path": "$.quote.quote_header.currency",
+          "to_path": "$.rfq.quote_header.currency"
+        }
+      ]
+    },
+    "incoterms": {
+      "delivered_cost_model": "landed_cost_table",
+      "rules": [
+        {
+          "id": "landed_cost_to_named_place",
+          "type": "landed_cost_convert",
+          "input_price_path": "$.quote.line_items[*].expected_unit_price",
+          "incoterms_path": "$.quote.quote_header.incoterms",
+          "named_place_path": "$.quote.quote_header.named_place",
+          "target_named_place_path": "$.rfq.cover.target_plants[*].plant_code",
+          "output_path": "$.quote.line_items[*].delivered_unit_cost"
+        }
+      ]
+    },
+    "tier_selection": {
+      "mode": "rfq_base_tier",
+      "rfq_base_tier_path": "$.rfq.volume_tier.base_tier_ref",
+      "rules": [
+        {
+          "id": "pick_expected_unit_price",
+          "type": "select_tier_price",
+          "tier_ref_path": "$.rfq.volume_tier.base_tier_ref",
+          "tier_prices_path": "$.quote.line_items[*].pricing_by_tier[*]",
+          "output_path": "$.quote.line_items[*].expected_unit_price"
+        }
+      ]
+    }
+  },
+  "gates": [
+    {
+      "id": "G1_required_fields",
+      "type": "required_fields",
+      "severity": "ON_HOLD",
+      "fields": [
+        "$.quote.quote_header.supplier_legal_name",
+        "$.quote.quote_header.currency",
+        "$.quote.quote_header.incoterms",
+        "$.quote.quote_header.quote_validity_days",
+        "$.quote.quote_header.standard_production_lt_days",
+        "$.quote.line_items[*].spec_id",
+        "$.quote.line_items[*].pricing_by_tier[*].unit_price",
+        "$.quote.line_items[*].price_unit"
+      ],
+      "message": "Required fields missing"
+    },
+    {
+      "id": "G2_quote_validity_min",
+      "type": "compare_number",
+      "severity": "DISQUALIFIED",
+      "op": ">=",
+      "left_path": "$.quote.quote_header.quote_validity_days",
+      "right_path": "$.rfq.cover.required_quote_validity_days",
+      "message": "Quote validity shorter than RFQ minimum"
+    },
+    {
+      "id": "G3_dg_un38_3",
+      "type": "equals_boolean",
+      "severity": "DISQUALIFIED",
+      "path": "$.quote.logistics.dg_un38_3_docs_available",
+      "value": true,
+      "message": "UN38.3 docs not available"
+    }
+  ],
+  "metrics": [
+    {
+      "id": "M1_total_tco",
+      "type": "sum",
+      "scope": "supplier",
+      "items": [
+        {
+          "id": "annual_spend",
+          "type": "sum",
+          "items_path": "$.quote.line_items[*]",
+          "value_expr": "line.delivered_unit_cost * rfq.assumptions.eval_qty_by_line_item[line.spec_id]"
+        }
+      ],
+      "output_path": "$.derived.total_tco"
+    },
+    {
+      "id": "M2_e2e_lt_days",
+      "type": "coalesce",
+      "scope": "supplier",
+      "candidates": [
+        "$.quote.quote_header.total_e2e_lt_days",
+        "$.quote.quote_header.standard_production_lt_days"
+      ],
+      "output_path": "$.derived.e2e_lt_days"
+    },
+    {
+      "id": "M3_completeness_pct",
+      "type": "completeness",
+      "scope": "supplier",
+      "required_fields_gate_id": "G1_required_fields",
+      "output_path": "$.derived.completeness_pct"
+    }
+  ],
+  "scoring": {
+    "categories": [
+      {
+        "id": "commercial",
+        "weight_default": 0.55,
+        "rules": [
+          {
+            "id": "S_comm_ratio_to_best",
+            "type": "ratio_score_to_best",
+            "value_path": "$.derived.total_tco",
+            "best_agg": "min_across_suppliers",
+            "cap_min": 0,
+            "cap_max": 100,
+            "output_path": "$.score.commercial"
+          },
+          {
+            "id": "S_comm_outlier_penalty",
+            "type": "penalty_if",
+            "when_expr": "derived.total_tco < (derived.market_tco_benchmark * 0.85)",
+            "delta": -5,
+            "reason": "Suspiciously low price (outlier)",
+            "output_path": "$.score_adjustments.commercial"
+          }
+        ]
+      },
+      {
+        "id": "delivery",
+        "weight_default": 0.2,
+        "rules": [
+          {
+            "id": "S_lt_ratio_to_best",
+            "type": "ratio_score_to_best",
+            "value_path": "$.derived.e2e_lt_days",
+            "best_agg": "min_across_suppliers",
+            "cap_min": 0,
+            "cap_max": 100,
+            "output_path": "$.score.delivery"
+          },
+          {
+            "id": "S_expedite_bonus",
+            "type": "bonus_if",
+            "when_expr": "quote.quote_header.expedite.available == true && quote.quote_header.expedite.lt_days <= (derived.e2e_lt_days * 0.75)",
+            "delta": 5,
+            "reason": "Expedite option provides >=25% LT reduction",
+            "output_path": "$.score_adjustments.delivery"
+          }
+        ]
+      },
+      {
+        "id": "capacity",
+        "weight_default": 0.1,
+        "rules": [
+          {
+            "id": "S_capacity_band",
+            "type": "linear_band_score",
+            "value_expr": "quote.capacity.monthly_steady_qty / rfq.assumptions.required_monthly_qty",
+            "bands": [
+              {
+                "gte": 1.2,
+                "score": 100
+              },
+              {
+                "gte": 1,
+                "score_range": [
+                  80,
+                  100
+                ],
+                "linear_between": [
+                  1,
+                  1.2
+                ]
+              },
+              {
+                "gte": 0.8,
+                "score_range": [
+                  40,
+                  80
+                ],
+                "linear_between": [
+                  0.8,
+                  1
+                ]
+              },
+              {
+                "lt": 0.8,
+                "score_range": [
+                  0,
+                  40
+                ],
+                "linear_between": [
+                  0.5,
+                  0.8
+                ]
+              }
+            ],
+            "output_path": "$.score.capacity"
+          },
+          {
+            "id": "S_flex_bonus",
+            "type": "bonus_if",
+            "when_expr": "quote.capacity.flex_pct >= 0.15 && quote.capacity.flex_notice_days <= 28",
+            "delta": 10,
+            "reason": "Flex capacity >=15% with <=4 weeks notice",
+            "output_path": "$.score_adjustments.capacity"
+          }
+        ]
+      },
+      {
+        "id": "terms",
+        "weight_default": 0.1,
+        "rules": [
+          {
+            "id": "S_payment_lookup",
+            "type": "table_lookup_score",
+            "value_path": "$.quote.quote_header.payment_terms",
+            "table": {
+              "Net 30": 60,
+              "Net 45": 75,
+              "Net 60": 90,
+              "Net 90": 100
+            },
+            "default_score": 50,
+            "output_path": "$.score.terms_payment"
+          },
+          {
+            "id": "S_moq_ratio",
+            "type": "ratio_score_to_best",
+            "value_path": "$.quote.quote_header.moq_qty",
+            "best_agg": "min_across_suppliers",
+            "cap_min": 0,
+            "cap_max": 100,
+            "output_path": "$.score.terms_moq"
+          },
+          {
+            "id": "S_warranty_lookup",
+            "type": "linear_score",
+            "value_path": "$.quote.quote_header.warranty_months",
+            "min_value": 12,
+            "max_value": 18,
+            "min_score": 80,
+            "max_score": 100,
+            "output_path": "$.score.terms_warranty"
+          },
+          {
+            "id": "S_pcn_linear",
+            "type": "linear_score",
+            "value_path": "$.quote.quote_header.pcn_notice_days",
+            "min_value": 60,
+            "max_value": 120,
+            "min_score": 60,
+            "max_score": 100,
+            "output_path": "$.score.terms_pcn"
+          },
+          {
+            "id": "S_terms_weighted",
+            "type": "weighted_sum",
+            "inputs": [
+              {
+                "path": "$.score.terms_payment",
+                "w": 0.35
+              },
+              {
+                "path": "$.score.terms_moq",
+                "w": 0.25
+              },
+              {
+                "path": "$.score.terms_warranty",
+                "w": 0.2
+              },
+              {
+                "path": "$.score.terms_pcn",
+                "w": 0.2
+              }
+            ],
+            "output_path": "$.score.terms"
+          }
+        ]
+      },
+      {
+        "id": "logistics",
+        "weight_default": 0.1,
+        "rules": [
+          {
+            "id": "S_dg_base",
+            "type": "boolean_score",
+            "path": "$.quote.logistics.dg_un38_3_docs_available",
+            "true_score": 70,
+            "false_score": 0,
+            "output_path": "$.score.logistics"
+          },
+          {
+            "id": "S_dg_pack_bonus",
+            "type": "bonus_if",
+            "when_expr": "quote.logistics.dg_packing_supported == true",
+            "delta": 20,
+            "reason": "DG packing supported",
+            "output_path": "$.score_adjustments.logistics"
+          },
+          {
+            "id": "S_pack_info_bonus",
+            "type": "bonus_if",
+            "when_expr": "quote.logistics.master_carton_qty != null && quote.logistics.pallet.cartons_per_pallet != null",
+            "delta": 10,
+            "reason": "Packaging/palletization info provided",
+            "output_path": "$.score_adjustments.logistics"
+          }
+        ]
+      },
+      {
+        "id": "exceptions",
+        "weight_default": 0.05,
+        "rules": [
+          {
+            "id": "S_exceptions_base",
+            "type": "constant_score",
+            "value": 100,
+            "output_path": "$.score.exceptions"
+          },
+          {
+            "id": "P_penalty_cap",
+            "type": "penalty_if",
+            "when_expr": "any(quote.exceptions[*].category == 'penalty_cap')",
+            "delta": -5,
+            "reason": "Penalty cap requested",
+            "output_path": "$.score_adjustments.exceptions"
+          },
+          {
+            "id": "P_price_reopener",
+            "type": "penalty_if",
+            "when_expr": "any(quote.exceptions[*].category == 'price_reopener')",
+            "delta": -3,
+            "reason": "Raw material price reopener requested",
+            "output_path": "$.score_adjustments.exceptions"
+          },
+          {
+            "id": "P_many_exceptions",
+            "type": "penalty_if",
+            "when_expr": "len(quote.exceptions) >= 3",
+            "delta": -2,
+            "reason": "Multiple exceptions increase negotiation overhead",
+            "output_path": "$.score_adjustments.exceptions"
+          }
+        ]
+      }
+    ],
+    "finalize": [
+      {
+        "id": "apply_adjustments",
+        "type": "apply_adjustments_and_clamp",
+        "base_scores_path": "$.score",
+        "adjustments_path": "$.score_adjustments",
+        "clamp_min": 0,
+        "clamp_max": 100,
+        "output_path": "$.score_final"
+      },
+      {
+        "id": "total_default",
+        "type": "weighted_sum",
+        "inputs": [
+          {
+            "path": "$.score_final.commercial",
+            "w": 0.45
+          },
+          {
+            "path": "$.score_final.delivery",
+            "w": 0.2
+          },
+          {
+            "path": "$.score_final.capacity",
+            "w": 0.1
+          },
+          {
+            "path": "$.score_final.terms",
+            "w": 0.1
+          },
+          {
+            "path": "$.score_final.logistics",
+            "w": 0.1
+          },
+          {
+            "path": "$.score_final.exceptions",
+            "w": 0.05
+          }
+        ],
+        "output_path": "$.total_score.default"
+      }
+    ]
+  },
+  "scenarios": {
+    "lowest_tco": {
+      "weights": {
+        "commercial": 0.6,
+        "delivery": 0.1,
+        "capacity": 0.05,
+        "terms": 0.1,
+        "logistics": 0.05,
+        "exceptions": 0.1
+      }
+    },
+    "fastest_lt": {
+      "weights": {
+        "commercial": 0.3,
+        "delivery": 0.4,
+        "capacity": 0.1,
+        "terms": 0.05,
+        "logistics": 0.1,
+        "exceptions": 0.05
+      }
+    },
+    "balanced": {
+      "weights": {
+        "commercial": 0.45,
+        "delivery": 0.2,
+        "capacity": 0.1,
+        "terms": 0.1,
+        "logistics": 0.1,
+        "exceptions": 0.05
+      }
+    },
+    "risk_averse": {
+      "weights": {
+        "commercial": 0.35,
+        "delivery": 0.15,
+        "capacity": 0.15,
+        "terms": 0.1,
+        "logistics": 0.15,
+        "exceptions": 0.1
+      }
+    }
+  },
+  "explain": {
+    "top_drivers": {
+      "count": 5,
+      "based_on": [
+        "score_final",
+        "score_adjustments",
+        "gates"
+      ]
+    }
+  },
+  "name": "TestRuleSet"
+}
