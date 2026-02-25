@@ -1041,6 +1041,7 @@ def build_scenarios(
     objective_policy: Optional[Dict[str, Any]] = None,
     fallback_policy: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
+    print("############## rfx-solver build_scenarios is called ###################")
     rfq_detail = rfq.get("detail") or {}
     rfq_lines = rfq_detail.get("rfqLines") or []
     if not rfq_lines:
