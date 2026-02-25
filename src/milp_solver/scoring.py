@@ -5,6 +5,7 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+from importlib.resources import files
 
 RULE_PATH = Path(__file__).resolve().parent.parent / "SupplierScoringRule.json"
 
@@ -121,7 +122,9 @@ DEFAULT_FINAL_LINE_CONFIG: Dict[str, Any] = {
 
 
 def _load_rule() -> Dict[str, Any]:
-    return json.loads(RULE_PATH.read_text(encoding="utf-8"))
+    # return json.loads(RULE_PATH.read_text(encoding="utf-8"))
+    rule_path = files("milp_solver").joinpath("SupplierScoringRule.json")
+    return json.loads(rule_path.read_text(encoding="utf-8"))
 
 
 def _safe_number(value: Any) -> Optional[float]:
